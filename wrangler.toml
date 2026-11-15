@@ -1,0 +1,8 @@
+name = "payment-guard"
+main = "src/worker.ts"
+compatibility_date = "2026-11-15"
+workers_dev = true
+
+# Deploy (needs a valid Cloudflare API token; the stored one is invalid):
+#   CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
+#   or: python3 ~/workspace/custom-connectors/custom.cloudflare/bin/cf.py deploy <account_id> payment-guard dist/worker.js

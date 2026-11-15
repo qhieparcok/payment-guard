@@ -1,0 +1,27 @@
+{
+  "name": "guard",
+  "version": "1.0.0",
+  "description": "Payment & Wallet Security Guard — zkVerify Agent Games Wildcard track. Screens crypto transfers/approvals before signing (ALLOW/WARN/BLOCK).",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "build": "esbuild src/worker.ts --bundle --format=esm --outfile=dist/worker.js --minify",
+    "test": "node --test test/engine.test.ts test/live.test.ts",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "js-sha3": "^0.9.3"
+  },
+  "type": "module"
+}
