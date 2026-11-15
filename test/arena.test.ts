@@ -8,6 +8,7 @@ import {
   REGISTERED_VK_HASH,
   decideTask,
   isGatekeeperTask,
+  normalizeProofTx,
   secretToKey,
   signResponseBody,
   verifyTaskSignature,
@@ -65,7 +66,9 @@ test("valid condition approves and records the proof reference", () => {
   assert.equal(v.decision, "APPROVE");
   assert.equal(v.reason_code, "VALID_CONDITION");
   assert.equal(v.proof_tx, PROOF_TX);
-  assert.ok(seen.has(PROOF_TX), "approval must record the proof reference");
+  // The seen-set is keyed on the NORMALIZED reference (no 0x prefix,
+  // lowercase), so the same proof in another casing is still caught.
+  assert.ok(seen.has(normalizeProofTx(PROOF_TX)), "approval must record the proof reference");
 });
 
 test("balance exactly at the minimum still approves", () => {
@@ -155,6 +158,54 @@ test("recipient comparison is case-insensitive", () => {
     ctx
   );
   assert.equal(v.decision, "APPROVE");
+});
+
+test("recipient matches without the 0x prefix", () => {
+  const { ctx } = freshCtx();
+  const v = decideTask(
+    task({ input: { recipient: RECIPIENT.slice(2), condition_recipient: RECIPIENT } }),
+    ctx
+  );
+  assert.equal(v.decision, "APPROVE");
+});
+
+test("VK matches without the 0x prefix", () => {
+  const { ctx } = freshCtx();
+  const v = decideTask(
+    task({
+      input: {
+        registered_vk: OFFICIAL_VK.slice(2),
+        proof_vk: OFFICIAL_VK.slice(2).toUpperCase(),
+      },
+    }),
+    ctx
+  );
+  assert.equal(v.decision, "APPROVE");
+});
+
+test("proof reuse is caught when the second submission uses different casing", () => {
+  const { ctx } = freshCtx();
+  const first = decideTask(task(), ctx);
+  assert.equal(first.decision, "APPROVE");
+  // Same proof reference, checksummed/uppercased: the normalized
+  // seen-set key must still catch it, or the agent would wrongly
+  // approve a reused proof (-6, the worst penalty).
+  const second = decideTask(
+    task({ task_id: "gk_24_9d2", input: { proof_tx: PROOF_TX.toUpperCase() } }),
+    ctx
+  );
+  assert.equal(second.decision, "REJECT");
+  assert.equal(second.reason_code, "PROOF_REUSED");
+});
+
+test("the verdict echoes the raw proof reference, as sent", () => {
+  const { ctx } = freshCtx();
+  const v = decideTask(
+    task({ input: { proof_tx: PROOF_TX.toUpperCase() } }),
+    ctx
+  );
+  assert.equal(v.decision, "APPROVE");
+  assert.equal(v.proof_tx, PROOF_TX.toUpperCase());
 });
 
 test("amount overflow rejects", () => {

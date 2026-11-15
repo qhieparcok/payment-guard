@@ -59,6 +59,28 @@ export interface GatekeeperVerdict {
   proof_tx: string;
 }
 
+// --- Hex normalization --------------------------------------------------
+
+// Canonical form of a hex value (address, vk hash, proof reference):
+// strip an optional 0x prefix and lowercase. The platform may send
+// the same value checksummed, lowercased, with or without the prefix;
+// without normalizing, the same value can look different and a valid
+// task is wrongly rejected — or a reused proof is missed, which is
+// worse (a wrong APPROVE costs more than a wrong REJECT).
+export function normalizeHex(value: string | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const t = value.trim().toLowerCase();
+  if (!t) return null;
+  return t.startsWith("0x") ? t.slice(2) : t;
+}
+
+// Canonical key for a proof reference in the seen-set (and in KV).
+// Same normalization as hexEqual, so a proof submitted once
+// checksummed and once lowercased still counts as the same proof.
+export function normalizeProofTx(value: string | undefined): string | null {
+  return normalizeHex(value);
+}
+
 // --- HMAC ---------------------------------------------------------------
 
 // Turn the configured secret into key bytes. The platform issues a
@@ -248,11 +270,14 @@ export async function signResponseBody(
 
 // --- Decision ------------------------------------------------------------
 
-// Compare two hex values (addresses, vk hashes) case-insensitively.
-// A missing or malformed value never counts as a match.
+// Compare two hex values (addresses, vk hashes) case-insensitively
+// and independent of the 0x prefix. A missing or malformed value
+// never counts as a match.
 function hexEqual(a: string | undefined, b: string | undefined): boolean {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
+  const na = normalizeHex(a);
+  const nb = normalizeHex(b);
+  if (na === null || nb === null) return false;
+  return na === nb;
 }
 
 function toBigInt(value: string | number | undefined): bigint | null {
@@ -288,6 +313,10 @@ export function decideTask(
 ): GatekeeperVerdict {
   const input = task.input ?? ({} as GatekeeperInput);
   const proofTx = typeof input.proof_tx === "string" ? input.proof_tx : "";
+  // The seen-set is keyed on the NORMALIZED reference, so the same
+  // proof submitted once checksummed and once lowercased is still
+  // caught as a reuse. The verdict echoes the raw reference, as sent.
+  const proofTxKey = normalizeProofTx(proofTx) ?? "";
 
   const reject = (reason_code: GatekeeperReason): GatekeeperVerdict => ({
     decision: "REJECT",
@@ -297,7 +326,7 @@ export function decideTask(
 
   // 1. Proof reuse. A proof reference that was already accepted in an
   // earlier task does not gain re-entry by being submitted again.
-  if (proofTx && ctx.seenProofTx.has(proofTx)) {
+  if (proofTxKey && ctx.seenProofTx.has(proofTxKey)) {
     return reject("PROOF_REUSED");
   }
 
@@ -343,8 +372,9 @@ export function decideTask(
   }
 
   // Every check passed. Record the approval so this proof reference
-  // is caught if it is ever submitted again.
-  if (proofTx) ctx.recordApproval(proofTx);
+  // is caught if it is ever submitted again. The normalized key is
+  // recorded, so the same proof in a different casing is still caught.
+  if (proofTxKey) ctx.recordApproval(proofTxKey);
   return { decision: "APPROVE", reason_code: "VALID_CONDITION", proof_tx: proofTx };
 }
 

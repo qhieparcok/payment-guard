@@ -3,6 +3,15 @@ main = "src/worker.ts"
 compatibility_date = "2026-11-15"
 workers_dev = true
 
-# Deploy (needs a valid Cloudflare API token; the stored one is invalid):
-#   CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
-#   or: python3 ~/workspace/custom-connectors/custom.cloudflare/bin/cf.py deploy <account_id> payment-guard dist/worker.js
+# Durable arena state: the proof-reuse seen-set and the idempotency
+# cache live in this KV namespace (created 15 Nov 2026), so a task
+# that lands on a fresh isolate still sees proofs approved earlier.
+# The deploy script (deploy.py) includes this binding in the upload
+# metadata; a deploy without it would drop the binding, so always
+# deploy through deploy.py, never plain cf.py deploy.
+[[kv_namespaces]]
+binding = "ARENA_KV"
+id = "01a7bd04c56749feb4f104904ad63df2"
+
+# Deploy: python3 deploy.py  (builds with tsc, then uploads with the
+# KV binding in the metadata via the stored custom.cloudflare token)

@@ -6,7 +6,16 @@ import { createHmac } from "node:crypto";
 
 const BASE = "https://payment-guard.parcok03.workers.dev";
 const SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const ENV = { AGENT_GAMES_HMAC_SECRET: SECRET };
+// In-memory stand-in for the ARENA_KV binding (the real Worker gets
+// the Cloudflare KV namespace). Shared across module instances, so a
+// fresh import simulates a new isolate that still sees KV state.
+const kvStore = new Map();
+const KV = {
+  get: async (k) => (kvStore.has(k) ? kvStore.get(k) : null),
+  put: async (k, v) => { kvStore.set(k, v); },
+};
+const ENV = { AGENT_GAMES_HMAC_SECRET: SECRET, ARENA_KV: KV };
+const NO_KV_ENV = { AGENT_GAMES_HMAC_SECRET: SECRET };
 const NO_SECRET_ENV = {};
 
 const RECIPIENT = "0xDe42000000000000000000000000000000009f01";
@@ -93,6 +102,7 @@ async function main() {
   const arenaOk = await r.json();
   const sigOut = r.headers.get("x-agent-games-signature");
   check("arena valid task -> APPROVE", r.status === 200 && arenaOk.decision === "APPROVE" && arenaOk.reason_code === "VALID_CONDITION", JSON.stringify(arenaOk));
+  check("arena response carries circuit_version", arenaOk.circuit_version === "gatekeeper-v1", JSON.stringify({ cv: arenaOk.circuit_version }));
   check("arena response is signed", typeof sigOut === "string" && /^[0-9a-f]{64}$/.test(sigOut));
   // The response signature must verify against the response body.
   const rawOk = JSON.stringify(arenaOk);
@@ -264,6 +274,57 @@ async function main() {
   );
   const screen2 = await r.json();
   check("POST /screen without signature still screens", r.status === 200 && screen2.decision === "ALLOW");
+
+  // /debug-secret was a temporary diagnostic for the preflight 401;
+  // the preflight passed, so the route is gone (404).
+  r = await worker.fetch(new Request(BASE + "/debug-secret"), ENV);
+  check("GET /debug-secret removed -> 404", r.status === 404);
+
+  // KV unavailable: the arena must still answer from memory alone.
+  // A missing KV binding must never cost a task.
+  const noKvBody = taskBody({ task_id: "gk_24_9d6" });
+  r = await worker.fetch(
+    new Request(BASE + "/arena/gatekeeper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": sign(noKvBody, SECRET) },
+      body: noKvBody,
+    }),
+    NO_KV_ENV
+  );
+  const noKv = await r.json();
+  check("arena works without KV binding (fail-safe fallback)", r.status === 200 && noKv.decision === "APPROVE", JSON.stringify(noKv));
+
+  // Cross-isolate durability: a fresh module import has empty
+  // in-memory state (new isolate) but shares the same KV. A reuse
+  // trap must still be caught, and a retried task must still return
+  // the identical body — both from KV, not from memory.
+  const fresh = (await import("./dist/worker.js?fresh=1")).default;
+  // Reuse: same proof_tx as the approved task, but a NEW task id.
+  // (taskBody spreads overrides into input, so set task_id directly.)
+  const reuseObj = JSON.parse(taskBody());
+  reuseObj.task_id = "gk_24_9d7";
+  const reuseBody = JSON.stringify(reuseObj);
+  r = await fresh.fetch(
+    new Request(BASE + "/arena/gatekeeper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": sign(reuseBody, SECRET) },
+      body: reuseBody,
+    }),
+    ENV
+  );
+  const reuse = await r.json();
+  check("cross-isolate reuse caught via KV -> PROOF_REUSED", r.status === 200 && reuse.decision === "REJECT" && reuse.reason_code === "PROOF_REUSED", JSON.stringify(reuse));
+  // Idempotency: retry the approved task on the fresh isolate.
+  r = await fresh.fetch(
+    new Request(BASE + "/arena/gatekeeper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": sign(goodBody, SECRET) },
+      body: goodBody,
+    }),
+    ENV
+  );
+  const retryFresh = await r.text();
+  check("cross-isolate retry returns identical body via KV", retryFresh === rawOk);
 
   console.log(`\n${pass} passed, ${fail} failed (of ${pass + fail} checks)`);
   if (fail > 0) process.exit(1);
