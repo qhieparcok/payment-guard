@@ -164,10 +164,13 @@ async function handleArena(
   }
 
   // A signed request that is not a gatekeeper task (for example a
-  // preflight check) gets a signed acknowledgement, not a decision.
+  // preflight check) gets a signed protocol-v1 acknowledgement, not a
+  // decision. The platform's preflight requires exactly this body:
+  // {"ok":true,"protocolVersion":"v1"} — with the same field order,
+  // signed with the HMAC secret. Anything else fails the diagnostic
+  // as "protocol" even when the request signature verified.
   if (!isGatekeeperTask(body)) {
-    const ack = { status: "ok", service: "payment-guard", version: VERSION, time: new Date().toISOString() };
-    const ackText = JSON.stringify(ack);
+    const ackText = '{"ok":true,"protocolVersion":"v1"}';
     const sig = await signResponseBodyWithKey(new TextEncoder().encode(ackText), verifiedKey);
     return new Response(ackText, {
       status: 200,

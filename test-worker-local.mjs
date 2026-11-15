@@ -228,6 +228,24 @@ async function main() {
   const b64 = await r.json();
   check("arena base64 signature -> APPROVE", r.status === 200 && b64.decision === "APPROVE", JSON.stringify(b64));
 
+  // Preflight: a signed request that is not a gatekeeper task must get
+  // exactly {"ok":true,"protocolVersion":"v1"} with a valid signature
+  // header — the platform's diagnostic rejects anything else as
+  // "protocol" even when the request signature verified.
+  const probeBody = JSON.stringify({ type: "agent-games.preflight.v1", agent: "payment-guard" });
+  r = await worker.fetch(
+    new Request(BASE + "/screen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": sign(probeBody, SECRET) },
+      body: probeBody,
+    }),
+    ENV
+  );
+  const probeText = await r.text();
+  const probeSig = r.headers.get("x-agent-games-signature");
+  const probeSigValid = probeSig === sign(probeText, SECRET);
+  check("preflight probe -> signed protocol-v1 JSON", r.status === 200 && probeText === '{"ok":true,"protocolVersion":"v1"}' && probeSigValid, probeText);
+
   // Screen without a signature header still works as a screen request
   r = await worker.fetch(
     new Request(BASE + "/screen", {
