@@ -103,7 +103,9 @@ seconds. Full protocol notes: `../arena/PROTOCOL.md`.
   The secret comes from the `AGENT_GAMES_HMAC_SECRET` Worker secret
   (set with `wrangler secret put AGENT_GAMES_HMAC_SECRET`). It is
   never committed anywhere. While it is not set, the arena route
-  fails closed.
+  fails closed. (The secret was first stored in the dashboard under
+  the name `Agent_games`; the worker also accepts that name as a
+  fallback, with the canonical name winning.)
 - **Decision.** A fixed checklist over the task fields. Approve only
   when every check passes: proof key matches the registered key *and*
   the registered key matches the value the platform published

@@ -35,8 +35,15 @@ const provider = new RpcProvider();
 // with `wrangler secret put AGENT_GAMES_HMAC_SECRET` and is never
 // committed anywhere. While it is not set, the arena route fails
 // closed: every signed task is rejected.
+//
+// NOTE (15 Nov 2026): the secret was first stored in the dashboard
+// under the name `Agent_games` instead of `AGENT_GAMES_HMAC_SECRET`,
+// so env.AGENT_GAMES_HMAC_SECRET was undefined and every signed
+// preflight/task got 401. Accept that name as a fallback so the
+// already-stored value is used; the canonical name still wins.
 interface ArenaEnv {
   AGENT_GAMES_HMAC_SECRET?: string;
+  Agent_games?: string;
 }
 
 // Best-effort per-IP rate limit (in-memory, per isolate). Returns true when
@@ -119,7 +126,7 @@ async function handleArena(
   signatureHeader: string | null,
   env: ArenaEnv
 ): Promise<Response> {
-  const secret = env.AGENT_GAMES_HMAC_SECRET;
+  const secret = env.AGENT_GAMES_HMAC_SECRET ?? env.Agent_games;
 
   // No secret configured, or a bad signature: reject before parsing.
   // There is nothing to decide when the request cannot be trusted.
