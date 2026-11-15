@@ -82,7 +82,7 @@ export function secretToKey(secret: string): Uint8Array {
   return new TextEncoder().encode(trimmed);
 }
 
-async function hmacHex(key: Uint8Array, data: Uint8Array): Promise<string> {
+async function hmacBytes(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     key as BufferSource,
@@ -91,9 +91,25 @@ async function hmacHex(key: Uint8Array, data: Uint8Array): Promise<string> {
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", cryptoKey, data as BufferSource);
-  return Array.from(new Uint8Array(sig))
+  return new Uint8Array(sig);
+}
+
+async function hmacHex(key: Uint8Array, data: Uint8Array): Promise<string> {
+  const sig = await hmacBytes(key, data);
+  return Array.from(sig)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+// Compare two byte arrays without short-circuiting, so the timing does
+// not leak how many leading bytes matched.
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
 }
 
 // Compare two hex digests without short-circuiting, so the timing does
@@ -109,16 +125,34 @@ function digestsEqual(a: string, b: string): boolean {
 
 // Verify the platform's signature over the exact raw request bytes.
 // Returns false when there is no signature, no secret, or a mismatch.
+// The platform's digest encoding is not documented, so accept both
+// lowercase hex (64 chars) and base64 (44 chars with padding).
 export async function verifyTaskSignature(
   rawBody: Uint8Array,
   signatureHeader: string | null,
   secret: string | undefined
 ): Promise<boolean> {
   if (!signatureHeader || !secret) return false;
-  const presented = signatureHeader.trim().toLowerCase().replace(/^sha256=/, "");
-  if (!/^[0-9a-f]{64}$/.test(presented)) return false;
-  const expected = await hmacHex(secretToKey(secret), rawBody);
-  return digestsEqual(presented, expected);
+  const presented = signatureHeader.trim().replace(/^sha256=/i, "");
+  const expected = await hmacBytes(secretToKey(secret), rawBody);
+  // Hex form first (64 hex chars, either case).
+  if (/^[0-9a-fA-F]{64}$/.test(presented)) {
+    const presentedBytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      presentedBytes[i] = parseInt(presented.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytesEqual(presentedBytes, expected);
+  }
+  // Then base64 (standard or URL-safe, with or without padding).
+  try {
+    const normalized = presented.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const decoded = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    if (decoded.length === 32) return bytesEqual(decoded, expected);
+  } catch {
+    // not base64; fall through to false
+  }
+  return false;
 }
 
 // Sign a response body with the same secret, for the
