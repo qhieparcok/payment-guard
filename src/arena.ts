@@ -123,36 +123,118 @@ function digestsEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-// Verify the platform's signature over the exact raw request bytes.
-// Returns false when there is no signature, no secret, or a mismatch.
-// The platform's digest encoding is not documented, so accept both
-// lowercase hex (64 chars) and base64 (44 chars with padding).
+// Candidate HMAC keys for one configured secret. The platform issues
+// a 32-byte secret, usually shown as 64 hex characters, but its own
+// signing code may use the hex-decoded bytes, the raw text, or the
+// base64-decoded bytes as the key — that choice is not documented.
+// Try them in that order; the first one that verifies wins. Every
+// candidate still needs the real secret, so accepting several
+// derivations does not weaken the check.
+export function candidateKeys(secret: string): Uint8Array[] {
+  const trimmed = secret.trim();
+  const keys: Uint8Array[] = [];
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      bytes[i] = parseInt(trimmed.slice(i * 2, i * 2 + 2), 16);
+    }
+    keys.push(bytes);
+  } else {
+    try {
+      const decoded = Uint8Array.from(atob(trimmed), (c) => c.charCodeAt(0));
+      if (decoded.length === 32) keys.push(decoded);
+    } catch {
+      // not base64; fall through to the raw text
+    }
+  }
+  keys.push(new TextEncoder().encode(trimmed));
+  return keys;
+}
+
+// Parse a presented signature into 32 bytes. Accepts lowercase or
+// uppercase hex (64 chars, optionally prefixed with "sha256=") and
+// base64 (standard or URL-safe, with or without padding).
+function parseSignature(presented: string): Uint8Array | null {
+  const p = presented.trim().replace(/^sha256=/i, "");
+  if (/^[0-9a-fA-F]{64}$/.test(p)) {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      bytes[i] = parseInt(p.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+  }
+  try {
+    const normalized = p.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const decoded = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    if (decoded.length === 32) return decoded;
+  } catch {
+    // not base64
+  }
+  return null;
+}
+
+// Canonical form of a JSON body: object keys sorted recursively,
+// compact separators. Some signers canonicalise before signing; try
+// it when the raw bytes do not verify. Returns null when the body is
+// not JSON or its canonical form is byte-identical to the raw body.
+function canonicalJsonBytes(rawBody: Uint8Array): Uint8Array | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(rawBody));
+  } catch {
+    return null;
+  }
+  const canon = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(canon);
+    if (v !== null && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+        out[k] = canon((v as Record<string, unknown>)[k]);
+      }
+      return out;
+    }
+    return v;
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(canon(parsed)));
+  if (bytes.length === rawBody.length && bytes.every((b, i) => b === rawBody[i])) return null;
+  return bytes;
+}
+
+// Verify the platform's signature over the request. Returns the key
+// bytes that verified (so the response can be signed with the same
+// derivation), or null when there is no signature, no secret, or no
+// match. Tries each key derivation against the raw body first, then
+// against the canonical JSON form, and accepts hex or base64
+// signature encodings.
 export async function verifyTaskSignature(
   rawBody: Uint8Array,
   signatureHeader: string | null,
   secret: string | undefined
-): Promise<boolean> {
-  if (!signatureHeader || !secret) return false;
-  const presented = signatureHeader.trim().replace(/^sha256=/i, "");
-  const expected = await hmacBytes(secretToKey(secret), rawBody);
-  // Hex form first (64 hex chars, either case).
-  if (/^[0-9a-fA-F]{64}$/.test(presented)) {
-    const presentedBytes = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) {
-      presentedBytes[i] = parseInt(presented.slice(i * 2, i * 2 + 2), 16);
+): Promise<Uint8Array | null> {
+  if (!signatureHeader || !secret) return null;
+  const presented = parseSignature(signatureHeader);
+  if (!presented) return null;
+  const bodies: Uint8Array[] = [rawBody];
+  const canon = canonicalJsonBytes(rawBody);
+  if (canon) bodies.push(canon);
+  for (const key of candidateKeys(secret)) {
+    for (const body of bodies) {
+      const expected = await hmacBytes(key, body);
+      if (bytesEqual(presented, expected)) return key;
     }
-    return bytesEqual(presentedBytes, expected);
   }
-  // Then base64 (standard or URL-safe, with or without padding).
-  try {
-    const normalized = presented.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-    const decoded = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-    if (decoded.length === 32) return bytesEqual(decoded, expected);
-  } catch {
-    // not base64; fall through to false
-  }
-  return false;
+  return null;
+}
+
+// Sign a response body with an already-resolved key (the one that
+// verified the incoming request), so the platform can verify the
+// response with the same derivation it used to sign the task.
+export async function signResponseBodyWithKey(
+  rawBody: Uint8Array,
+  key: Uint8Array
+): Promise<string> {
+  return hmacHex(key, rawBody);
 }
 
 // Sign a response body with the same secret, for the

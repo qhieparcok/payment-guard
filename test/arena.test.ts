@@ -4,6 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  GATEKEEPER_TASK_TYPE,
   REGISTERED_VK_HASH,
   decideTask,
   isGatekeeperTask,
@@ -195,31 +196,85 @@ const bodyBytes = new TextEncoder().encode(bodyText);
 test("HMAC verifies a correct signature", async () => {
   const sig = await signResponseBody(bodyBytes, TEST_SECRET);
   assert.match(sig, /^[0-9a-f]{64}$/);
-  assert.equal(await verifyTaskSignature(bodyBytes, sig, TEST_SECRET), true);
+  const key = await verifyTaskSignature(bodyBytes, sig, TEST_SECRET);
+  assert.ok(key);
+  assert.deepEqual(key, secretToKey(TEST_SECRET));
 });
 
 test("HMAC rejects a tampered body", async () => {
   const sig = await signResponseBody(bodyBytes, TEST_SECRET);
   const tampered = new TextEncoder().encode(bodyText.replace("1460", "1461"));
-  assert.equal(await verifyTaskSignature(tampered, sig, TEST_SECRET), false);
+  assert.equal(await verifyTaskSignature(tampered, sig, TEST_SECRET), null);
 });
 
 test("HMAC rejects a wrong secret", async () => {
   const sig = await signResponseBody(bodyBytes, TEST_SECRET);
-  assert.equal(await verifyTaskSignature(bodyBytes, sig, OTHER_SECRET), false);
+  assert.equal(await verifyTaskSignature(bodyBytes, sig, OTHER_SECRET), null);
 });
 
 test("HMAC rejects a missing secret and a missing signature", async () => {
   const sig = await signResponseBody(bodyBytes, TEST_SECRET);
-  assert.equal(await verifyTaskSignature(bodyBytes, sig, undefined), false);
-  assert.equal(await verifyTaskSignature(bodyBytes, null, TEST_SECRET), false);
-  assert.equal(await verifyTaskSignature(bodyBytes, "", TEST_SECRET), false);
+  assert.equal(await verifyTaskSignature(bodyBytes, sig, undefined), null);
+  assert.equal(await verifyTaskSignature(bodyBytes, null, TEST_SECRET), null);
+  assert.equal(await verifyTaskSignature(bodyBytes, "", TEST_SECRET), null);
 });
 
 test("HMAC rejects a malformed signature", async () => {
-  assert.equal(await verifyTaskSignature(bodyBytes, "not-hex", TEST_SECRET), false);
-  assert.equal(await verifyTaskSignature(bodyBytes, "00".repeat(31), TEST_SECRET), false);
+  assert.equal(await verifyTaskSignature(bodyBytes, "not-hex", TEST_SECRET), null);
+  assert.equal(await verifyTaskSignature(bodyBytes, "00".repeat(31), TEST_SECRET), null);
 });
+
+// The platform's key derivation is not documented: it may sign with
+// the hex-decoded bytes, the raw secret text, or base64-decoded bytes.
+// All three must verify, and the returned key must be the one used.
+test("HMAC verifies a signature made with the raw secret text as key", async () => {
+  const rawKey = new TextEncoder().encode(TEST_SECRET);
+  const sig = await hmacHexForTest(rawKey, bodyBytes);
+  const key = await verifyTaskSignature(bodyBytes, sig, TEST_SECRET);
+  assert.ok(key);
+  assert.deepEqual(key, rawKey);
+});
+
+test("HMAC verifies a base64-encoded signature", async () => {
+  const sigHex = await signResponseBody(bodyBytes, TEST_SECRET);
+  const bytes = Uint8Array.from(sigHex.match(/../g)!, (h) => parseInt(h, 16));
+  const sigB64 = btoa(String.fromCharCode(...bytes));
+  const key = await verifyTaskSignature(bodyBytes, sigB64, TEST_SECRET);
+  assert.ok(key);
+  assert.deepEqual(key, secretToKey(TEST_SECRET));
+});
+
+test("HMAC verifies a signature over canonical JSON when the body is not canonical", async () => {
+  // The raw body below has its keys in a different order than the
+  // canonical (sorted) form. Sign the canonical form; the worker
+  // must still verify it against the raw body it received.
+  const raw = JSON.stringify({ input: task().input, mode: "competition", type: GATEKEEPER_TASK_TYPE, task_id: task().task_id });
+  const canonical = canonicalize(JSON.parse(raw));
+  const sig = await signResponseBody(new TextEncoder().encode(canonical), TEST_SECRET);
+  const key = await verifyTaskSignature(new TextEncoder().encode(raw), sig, TEST_SECRET);
+  assert.ok(key);
+});
+
+// Canonical JSON (sorted keys, compact) used only by the test above
+// to build the form a canonicalising signer would produce.
+function canonicalize(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalize).join(",")}]`;
+  if (v !== null && typeof v === "object") {
+    const entries = Object.keys(v as Record<string, unknown>)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalize((v as Record<string, unknown>)[k])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+// Small local helper so the raw-key test does not depend on arena's
+// signing path (which always uses the hex-decoded key).
+async function hmacHexForTest(key: Uint8Array, body: Uint8Array): Promise<string> {
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, body);
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 test("secretToKey decodes a 64-hex secret to 32 bytes", () => {
   const key = secretToKey(TEST_SECRET);

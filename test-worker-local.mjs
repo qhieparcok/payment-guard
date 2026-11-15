@@ -38,6 +38,12 @@ function sign(text, secret) {
   return createHmac("sha256", Buffer.from(secret, "hex")).update(text).digest("hex");
 }
 
+// Sign with the raw secret text as the key (no hex decoding) — the
+// derivation the platform may use. The worker must accept it too.
+function signRawKey(text, secret) {
+  return createHmac("sha256", Buffer.from(secret, "utf8")).update(text).digest("hex");
+}
+
 let pass = 0;
 let fail = 0;
 function check(name, cond, extra = "") {
@@ -193,6 +199,34 @@ async function main() {
   );
   const viaScreen = await r.json();
   check("arena task via POST /screen -> APPROVE", r.status === 200 && viaScreen.decision === "APPROVE", JSON.stringify(viaScreen));
+
+  // Arena: same task signed with the RAW secret text as key -> APPROVE.
+  // This is the derivation the platform may use; the worker accepts it.
+  const rawKeyBody = taskBody({ task_id: "gk_24_9d4" });
+  r = await worker.fetch(
+    new Request(BASE + "/arena/gatekeeper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": signRawKey(rawKeyBody, SECRET) },
+      body: rawKeyBody,
+    }),
+    ENV
+  );
+  const rawKey = await r.json();
+  check("arena raw-string-key signature -> APPROVE", r.status === 200 && rawKey.decision === "APPROVE", JSON.stringify(rawKey));
+
+  // Arena: same task signed with the hex key but sent as base64 -> APPROVE.
+  const b64Body = taskBody({ task_id: "gk_24_9d5" });
+  const b64Sig = Buffer.from(sign(b64Body, SECRET), "hex").toString("base64");
+  r = await worker.fetch(
+    new Request(BASE + "/arena/gatekeeper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-agent-games-signature": b64Sig },
+      body: b64Body,
+    }),
+    ENV
+  );
+  const b64 = await r.json();
+  check("arena base64 signature -> APPROVE", r.status === 200 && b64.decision === "APPROVE", JSON.stringify(b64));
 
   // Screen without a signature header still works as a screen request
   r = await worker.fetch(

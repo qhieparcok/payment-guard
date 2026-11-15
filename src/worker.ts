@@ -17,7 +17,7 @@ import {
   GATEKEEPER_TASK_TYPE,
   decideTask,
   isGatekeeperTask,
-  signResponseBody,
+  signResponseBodyWithKey,
   verifyTaskSignature,
 } from "./arena.js";
 import type { ScreenResult } from "./types.js";
@@ -118,6 +118,25 @@ function handleHealth(): Response {
   return json({ status: "ok", service: "payment-guard", version: VERSION, time: new Date().toISOString() });
 }
 
+// Temporary diagnostic (15 Nov 2026): reports ONLY whether a secret is
+// configured and its length/format — never the value. Used to check
+// whether the stored secret is even the right kind of credential
+// (a 32-byte HMAC secret is 64 hex chars or 44 base64 chars).
+// Remove this route once the preflight 401 is resolved.
+function handleDebugSecret(env: ArenaEnv): Response {
+  const secret = env.AGENT_GAMES_HMAC_SECRET ?? env.Agent_games;
+  if (!secret) {
+    return json({ secret_configured: false, secret_length: null, secret_format: null });
+  }
+  const trimmed = secret.trim();
+  const format = /^[0-9a-fA-F]{64}$/.test(trimmed)
+    ? "hex64"
+    : /^[A-Za-z0-9+/=_-]{44}$/.test(trimmed)
+      ? "base64"
+      : "other";
+  return json({ secret_configured: true, secret_length: trimmed.length, secret_format: format });
+}
+
 // Arena task handler. rawBody is the exact request bytes; the HMAC is
 // verified against them before the body is parsed.
 async function handleArena(
@@ -130,8 +149,10 @@ async function handleArena(
 
   // No secret configured, or a bad signature: reject before parsing.
   // There is nothing to decide when the request cannot be trusted.
-  const ok = await verifyTaskSignature(rawBody, signatureHeader, secret);
-  if (!ok) {
+  // verifyTaskSignature returns the key derivation that verified, so
+  // the response is signed with the same one the platform used.
+  const verifiedKey = await verifyTaskSignature(rawBody, signatureHeader, secret);
+  if (!verifiedKey) {
     return json({ error: "invalid or missing task signature", code: "BAD_SIGNATURE" }, 401);
   }
 
@@ -147,7 +168,7 @@ async function handleArena(
   if (!isGatekeeperTask(body)) {
     const ack = { status: "ok", service: "payment-guard", version: VERSION, time: new Date().toISOString() };
     const ackText = JSON.stringify(ack);
-    const sig = await signResponseBody(new TextEncoder().encode(ackText), secret as string);
+    const sig = await signResponseBodyWithKey(new TextEncoder().encode(ackText), verifiedKey);
     return new Response(ackText, {
       status: 200,
       headers: {
@@ -169,9 +190,9 @@ async function handleArena(
       headers: {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
-        "x-agent-games-signature": await signResponseBody(
+        "x-agent-games-signature": await signResponseBodyWithKey(
           new TextEncoder().encode(cached),
-          secret as string
+          verifiedKey
         ),
       },
     });
@@ -197,7 +218,7 @@ async function handleArena(
   });
   taskResponses.set(task.task_id, responseBody);
 
-  const sig = await signResponseBody(new TextEncoder().encode(responseBody), secret as string);
+  const sig = await signResponseBodyWithKey(new TextEncoder().encode(responseBody), verifiedKey);
   return new Response(responseBody, {
     status: 200,
     headers: {
@@ -236,6 +257,7 @@ export default {
     }
 
     if (url.pathname === "/health" && req.method === "GET") return handleHealth();
+    if (url.pathname === "/debug-secret" && req.method === "GET") return handleDebugSecret(env);
     if (url.pathname === "/demo" && req.method === "GET") {
       return new Response(demoHtml, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
     }
