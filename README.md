@@ -81,12 +81,53 @@ Open `/demo` in a browser. The three buttons fill in real mainnet cases:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/screen` | Screen a transfer or approval. Body ≤ 10 KB, JSON. See request format above. `kind` is `"transfer"` or `"approval"`; `spender` + `approval_amount` are required for approvals. `token` is an ERC-20 address or `"native"`. `amount` is a decimal string of integer base units (BigInt — never a float). Chains: `eth` (1), `bsc` (56), `base` (8453). |
+| `POST` | `/screen` | Screen a transfer or approval. Body ≤ 10 KB, JSON. See request format above. `kind` is `"transfer"` or `"approval"`; `spender` + `approval_amount` are required for approvals. `token` is an ERC-20 address or `"native"`. `amount` is a decimal string of integer base units (BigInt — never a float). Chains: `eth` (1), `bsc` (56), `base` (8453). Also accepts signed Proof Gatekeeper arena tasks (see below). |
+| `POST` | `/arena/gatekeeper` | Proof Gatekeeper arena tasks (signed). See "Arena (Proof Gatekeeper)". |
 | `GET` | `/health` | `{ "status": "ok", "service": "payment-guard", "version": "1.0.0", "time": ... }` |
 | `GET` | `/demo` | Interactive demo page (the 3 examples above) |
 | `GET` | `/` | Service info + endpoint list |
 
-Errors are plain JSON: `400 INVALID_INPUT` (bad address / amount / chain / unknown field), `400 INVALID_JSON`, `413 BODY_TOO_LARGE`, `429 RATE_LIMITED` (60/min per IP), `404 NOT_FOUND`.
+Errors are plain JSON: `400 INVALID_INPUT` (bad address / amount / chain / unknown field), `400 INVALID_JSON`, `401 BAD_SIGNATURE` (arena task with a bad or missing HMAC signature, or no secret configured), `413 BODY_TOO_LARGE`, `429 RATE_LIMITED` (60/min per IP), `404 NOT_FOUND`.
+
+## Arena (Proof Gatekeeper)
+
+The same worker also plays the Proof Gatekeeper track. The platform
+posts a signed task envelope to the registered endpoint (`/screen`),
+and the agent answers with one deterministic decision within 60
+seconds. Full protocol notes: `../arena/PROTOCOL.md`.
+
+- **HMAC first.** Every task carries an `x-agent-games-signature`
+  header (HMAC-SHA256, hex, over the exact raw body). The signature is
+  verified before the body is parsed. A bad signature, a missing
+  signature, or a missing secret is a 401 — no decision is made.
+  The secret comes from the `AGENT_GAMES_HMAC_SECRET` Worker secret
+  (set with `wrangler secret put AGENT_GAMES_HMAC_SECRET`). It is
+  never committed anywhere. While it is not set, the arena route
+  fails closed.
+- **Decision.** A fixed checklist over the task fields. Approve only
+  when every check passes: proof key matches the registered key *and*
+  the registered key matches the value the platform published
+  (`0x6b79c6...d77b0`), public balance meets the minimum, the condition
+  has not expired, the recipient matches the condition, the amount is
+  within the cap, and the proof reference was not already accepted.
+  First mismatch wins and names the trap (`VK_SUBSTITUTION`,
+  `THRESHOLD_MISMATCH`, `PROOF_REUSED`, `EXPIRED_CONDITION`,
+  `RECIPIENT_MISMATCH`, `AMOUNT_OVERFLOW`). Any error or uncertainty
+  is a REJECT.
+- **Idempotency.** Task IDs are idempotency keys: a retried task gets
+  the byte-identical response it got the first time.
+- **Response.** `{ decision, reason_code, proof_tx }`, signed with
+  `x-agent-games-signature` over the raw response body.
+- **No proof attached yet.** The decision is correct and complete,
+  but no Groth16 proof is generated inside the Worker: proving takes
+  about 1.2 s of elliptic-curve CPU (measured locally), which the free
+  Worker plan does not allow per request — attempting it would kill
+  the response and score a timeout instead of a decision. So the agent
+  answers the decision and takes the missing-proof deduction (−2 per
+  provable task, no reliability bonus) rather than timing out. The
+  proving pipeline itself is verified locally with the tournament's
+  own circuit (see "Test results"), and the code is ready for a
+  separate proving service.
 
 ## How to verify a decision
 
@@ -101,6 +142,9 @@ Errors are plain JSON: `400 INVALID_INPUT` (bad address / amount / chain / unkno
 - **Live tests:** 6/6 pass — real read-only calls to BSC/ETH mainnet (USDT contracts, burn address, a documented phishing contract, all 3 demo cases).
 - **Load test:** 50 sequential `/screen` calls against real RPCs — p50 229 ms, **p95 401 ms**, max 1,692 ms. The engine itself is < 2 ms; the rest is public-RPC latency.
 - **End-to-end worker test:** the bundled worker (`dist/worker.js`) called directly — `/health`, `/demo`, all 3 demo decisions, and the 400/404 error paths all behave as documented.
+- **Arena unit tests:** 21/21 pass (`test/arena.test.ts`) — the decision checklist against all seven trap varieties (valid, VK substitution, unregistered keys, threshold, reuse, expired, recipient, amount, plus boundary cases), and the HMAC checks (correct signature verifies; tampered body, wrong secret, missing secret, missing signature, and malformed signature all rejected).
+- **Arena end-to-end test:** 15/15 pass (`test-worker-local.mjs`) — the built worker called directly: health/demo/screen still work, a valid signed task returns APPROVE with a verifiable response signature, a retried task returns the identical body, an amount-overflow trap returns REJECT, and tampered body / wrong secret / missing secret / missing signature all return 401. An arena task posted to the registered endpoint (`/screen`) is answered as an arena task.
+- **Groth16 proof (local, snarkjs 0.7.6):** the tournament's own circuit files, verified by hash. A valid approve proof builds in ~1.2 s (cold) / ~300 ms (warm) and `snarkjs groth16 verify` returns OK; the commitment matches `Poseidon(salt, taskId)`. Full trap matrix: for each of the six on-circuit trap varieties, the correct decision builds and verifies and the wrong decision is refused by the circuit (`Assert Failed. Error in template GatekeeperEvaluation_79 line: 102`). For two equal but unregistered keys the circuit accepts the approve proof — which is exactly why the agent checks the registered key against the published value off-circuit. See `../arena/PROTOCOL.md`.
 
 ## Limits (honest)
 
@@ -139,14 +183,21 @@ guard/
     lists.ts      scam deny-list (1,500) + known spenders + known tokens
     onchain.ts    read-only RPC + Blockscout provider (no key needed)
     engine.ts     deterministic screening engine (10 rules, fail-closed)
-    worker.ts     Cloudflare Worker entry (POST /screen, GET /health, /demo, /)
+    arena.ts      Proof Gatekeeper arena logic (HMAC, decision checklist)
+    worker.ts     Cloudflare Worker entry (POST /screen, /arena/gatekeeper, GET /health, /demo, /)
     demo.ts       demo page HTML
   test/
     engine.test.ts  18 unit tests (mock provider)
     live.test.ts    6 live tests (real mainnet, read-only)
+    arena.test.ts   21 arena unit tests (decision checklist + HMAC)
+  test-worker-local.mjs  15 end-to-end worker tests (built bundle, no network)
   wrangler.toml   worker config
   README.md       this file
 ```
+
+The arena protocol notes, circuit files, and proving scripts live in
+`../arena/` (`PROTOCOL.md`, `circuits/`, `test-proof.cjs`,
+`test-trap-matrix.cjs`, `probe-signals.cjs`).
 
 ## Status
 
